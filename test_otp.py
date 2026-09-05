@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 import html
+import hmac
 import os
 import unicodedata
 from datetime import datetime
@@ -59,6 +60,8 @@ PRICE_MUL = int(os.getenv("PRICE_MUL", "3000"))
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL", "https://accstore-47e37-default-rtdb.asia-southeast1.firebasedatabase.app")
 # Firebase legacy secret — chỉ cần để bot GHI heartbeat lên settings/botStatus (tùy chọn).
 FIREBASE_SECRET = os.getenv("FIREBASE_SECRET", "")
+WEBHOOK_TOKEN = os.getenv("SEPAY_WEBHOOK_TOKEN", "").strip()
+SEPAY_FORWARD_URL = os.getenv("SEPAY_FORWARD_URL", "").strip().rstrip("/")
 
 # Cấu hình động đọc từ Firebase settings/config (đồng bộ với web admin).
 # Khởi tạo từ env/hardcode ở trên, sau đó refresh_runtime_config() sẽ ghi đè định kỳ.
@@ -4249,6 +4252,41 @@ def _extract_amount_content_txn(payload):
 
     return amount, content, txn_id
 
+
+def webhook_authorized(request: Request) -> bool:
+    if not WEBHOOK_TOKEN:
+        return True
+    supplied = request.headers.get("x-webhook-token", "")
+    if not supplied:
+        supplied = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    return bool(supplied) and hmac.compare_digest(supplied, WEBHOOK_TOKEN)
+
+
+async def forward_sepay_event(payload, request: Request) -> bool:
+    """Chuyển giao dịch chưa khớp sang webhook của bot còn lại."""
+    if not SEPAY_FORWARD_URL or request.headers.get("x-sepay-forwarded") == "1":
+        return False
+    headers = {"X-Sepay-Forwarded": "1"}
+    if WEBHOOK_TOKEN:
+        headers["X-Webhook-Token"] = WEBHOOK_TOKEN
+    target_url = SEPAY_FORWARD_URL.rstrip("/")
+    if not target_url.endswith("/sepay/webhook"):
+        target_url += "/sepay/webhook"
+    try:
+        response = await HTTP_CLIENT.post(
+            target_url,
+            json=payload,
+            headers=headers,
+        )
+        if response.status_code < 200 or response.status_code >= 300:
+            logging.warning("Forwarded SePay event failed with HTTP %s", response.status_code)
+            return False
+        logging.info("Forwarded unmatched SePay event to secondary bot")
+        return True
+    except httpx.HTTPError:
+        logging.exception("Could not forward SePay event to secondary bot")
+        return False
+
 # --- FIREBASE WEB INTEGRATION ---
 async def process_firebase_deposit(amount: int, normalized_content: str, txn_id: str) -> bool:
     try:
@@ -4261,6 +4299,10 @@ async def process_firebase_deposit(amount: int, normalized_content: str, txn_id:
             return False
 
         for memo, req in requests.items():
+            # Yêu cầu nạp của bot bán tài khoản được xử lý bởi webhook của bot đó.
+            # Tránh hai worker cùng cộng tiền nếu dùng chung Firebase.
+            if req.get("source") == "telegram":
+                continue
             if req.get("status") == "Chờ duyệt":
                 norm_memo = normalize_payment_text(memo)
                 req_amount = int(req.get("amount", 0))
@@ -4312,6 +4354,8 @@ async def sepay_webhook_get():
 
 @app.post("/sepay/webhook")
 async def sepay_webhook_post(request: Request):
+    if not webhook_authorized(request):
+        return {"ok": False, "message": "unauthorized"}
     try:
         payload = await request.json()
     except Exception:
@@ -4324,7 +4368,8 @@ async def sepay_webhook_post(request: Request):
     amount, content, txn_id = _extract_amount_content_txn(payload)
 
     if amount <= 0 or not content:
-        return {"ok": True, "message": "ignored"}
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "ignored"}
 
     expire_old_pending_orders()
     orders = get_payment_matchable_orders()
@@ -4348,7 +4393,8 @@ async def sepay_webhook_post(request: Request):
         logging.info(
             f"SEPAY no match | amount={amount} | content={content} | normalized={normalized_content}"
         )
-        return {"ok": True, "message": "no match"}
+        forwarded = await forward_sepay_event(payload, request)
+        return {"ok": True, "message": "forwarded" if forwarded else "no match"}
 
     if is_order_expired(matched):
         mark_order_expired(int(matched["id"]))
