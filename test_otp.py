@@ -4,8 +4,12 @@ import sqlite3
 import html
 import hmac
 import os
+import secrets
 import unicodedata
-from datetime import datetime
+from collections import defaultdict
+from contextlib import closing
+from functools import wraps
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from io import BytesIO
@@ -36,6 +40,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     KeyboardButton,
 )
+from customer_api import CustomerApi, init_customer_api_schema
 
 _AiogramInlineKeyboardButton = InlineKeyboardButton
 BUTTON_STYLES_ENABLED = os.getenv("TELEGRAM_BUTTON_STYLES", "1") != "0"
@@ -119,6 +124,20 @@ HTTP_CLIENT = httpx.AsyncClient(
 )
 
 BALANCE_LOCK = asyncio.Lock()
+RENTAL_LOCKS = defaultdict(asyncio.Lock)
+PURCHASE_LOCKS = defaultdict(asyncio.Lock)
+OTP_WATCH_TASKS = {}
+OTP_POLL_LIMIT = asyncio.Semaphore(5)
+OTP_WAIT_SECONDS = 420
+OTP_POLL_SECONDS = 7
+
+
+def serialize_wallet_purchase(handler):
+    @wraps(handler)
+    async def wrapped(event, *args, **kwargs):
+        async with PURCHASE_LOCKS[event.from_user.id]:
+            return await handler(event, *args, **kwargs)
+    return wrapped
 DEFAULT_NOTE = "📌 Ghi chú: OTP về sẽ tính tiền. Nếu sau thời gian chờ không có OTP thì hệ thống sẽ hoàn tiền."
 QR_TEMPLATE_PATH = BASE_DIR / "qr_mau_nguoi_cam_giay.jpg"
 
@@ -303,6 +322,8 @@ def init_db():
         cur.execute("ALTER TABLE otp_history ADD COLUMN status TEXT NOT NULL DEFAULT 'expired'")
     if otp_hist_cols and 'otp_code' not in otp_hist_cols:
         cur.execute("ALTER TABLE otp_history ADD COLUMN otp_code TEXT")
+    if 'source' not in otp_hist_cols:
+        cur.execute("ALTER TABLE otp_history ADD COLUMN source TEXT NOT NULL DEFAULT 'bot'")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_favorites(
@@ -314,6 +335,23 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rental_intents(
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            app_id INTEGER NOT NULL,
+            app_name TEXT NOT NULL,
+            sell_price INTEGER NOT NULL,
+            carrier TEXT,
+            phone TEXT,
+            history_id INTEGER,
+            deposit_id INTEGER,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_otp_waiting ON otp_history(status, user_id, req_id)")
+    init_customer_api_schema(conn)
     conn.commit()
     conn.close()
 
@@ -349,8 +387,11 @@ def update_balance(user_id, amount, full_name=None, username=None, note=""):
         cur.execute("""
             UPDATE users
             SET balance = balance + ?
-            WHERE user_id = ?
-        """, (amount, user_id))
+            WHERE user_id = ? AND (? >= 0 OR balance + ? >= 0)
+        """, (amount, user_id, amount, amount))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
 
         cur.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
         row = cur.fetchone()
@@ -990,10 +1031,10 @@ def save_otp_history(user_id, app_id, app_name, phone, sell_price, raw_phone=Non
             VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting')
         """, (user_id, int(app_id), app_name, phone, raw_phone, req_id, sell_price))
         history_id = cur.lastrowid
-        # Giữ chỉ OTP_HISTORY_MAX bản ghi mới nhất, xóa bản ghi cũ hơn
+        # Không xóa phiên đang chờ: cần giữ để khôi phục và hoàn tiền sau restart.
         conn.execute("""
             DELETE FROM otp_history
-            WHERE user_id = ? AND id NOT IN (
+            WHERE user_id = ? AND status <> 'waiting' AND source <> 'api' AND id NOT IN (
                 SELECT id FROM otp_history
                 WHERE user_id = ?
                 ORDER BY id DESC
@@ -1059,6 +1100,15 @@ def get_active_otp_history(user_id: int, limit: int = 10):
         """, (user_id, limit)).fetchall()
     finally:
         conn.close()
+
+
+def get_all_waiting_otp():
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM otp_history
+            WHERE status = 'waiting' AND req_id IS NOT NULL AND req_id <> ''
+            ORDER BY id
+        """).fetchall()
 
 
 def update_otp_history_status(user_id: int, req_id, status: str, otp_code=None):
@@ -1209,10 +1259,14 @@ class ChayCodeAPI:
         params['apik'] = RUNTIME_CONFIG["otp_api_key"]
         try:
             response = await HTTP_CLIENT.get(RUNTIME_CONFIG["otp_base_url"], params=params)
-            return response.json()
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("Invalid OTP response")
+            return result
         except Exception:
             logging.exception("Lỗi gọi OTP API")
-            return {"ResponseCode": 1, "Msg": "Lỗi kết nối Server"}
+            return {"ResponseCode": 1, "Msg": "Lỗi kết nối Server", "_transport_error": True}
 
     async def get_apps(self):
         return await self._get({'act': 'app'})
@@ -1438,7 +1492,36 @@ def get_active_otp_count(user_id: int) -> int:
 
 def normalize_search_text(value: str) -> str:
     normalized = unicodedata.normalize("NFD", (value or "").lower().strip())
-    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return " ".join("".join(ch for ch in normalized if unicodedata.category(ch) != "Mn").replace("đ", "d").split())
+
+
+SEARCH_ALIASES = {
+    "fb": ("facebook",), "face": ("facebook",),
+    "gg": ("google", "gmail"), "gm": ("gmail",),
+    "ig": ("instagram",), "insta": ("instagram",),
+    "tele": ("telegram",), "tg": ("telegram",),
+    "tt": ("tiktok",), "tik tok": ("tiktok",),
+    "wa": ("whatsapp",), "yt": ("youtube",),
+    "dv khac": ("dich vu khac",), "khac": ("dich vu khac",),
+}
+
+
+def search_services(apps, query):
+    query = normalize_search_text(query)
+    terms = SEARCH_ALIASES.get(query, (query,))
+    matches = [item for item in apps if any(term in normalize_search_text(item.get("Name", "")) for term in terms)]
+    return sorted(matches, key=lambda item: (
+        not any(normalize_search_text(item.get("Name", "")).startswith(term) for term in terms),
+        normalize_search_text(item.get("Name", "")),
+    ))
+
+
+def search_navigation_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 DỊCH VỤ KHÁC", callback_data="search_other", style="primary")],
+        [InlineKeyboardButton(text="← Về danh mục", callback_data="otp_list")],
+        [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
+    ])
 
 
 def main_menu_text(user_id: int, full_name: str) -> str:
@@ -1694,6 +1777,7 @@ def main_menu_keyboard(user_id):
         )])
 
     rows.extend([
+        [InlineKeyboardButton(text="🔌 API cho khách", callback_data="customer_api", style="primary")],
         [
             InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit", style="success"),
             InlineKeyboardButton(text="📥 Đơn nạp", callback_data="deposit_orders", style="primary"),
@@ -1730,12 +1814,15 @@ async def reset_bot_on_startup():
             BotCommand(command="quick", description="Bật phím nhanh"),
             BotCommand(command="hidequick", description="Ẩn phím nhanh"),
             BotCommand(command="help", description="Hướng dẫn sử dụng"),
+            BotCommand(command="api", description="API key và hướng dẫn tích hợp"),
         ], scope=default_scope)
         await bot.set_my_commands([
             BotCommand(command="start",       description="Mở trang chủ"),
             BotCommand(command="quick",       description="Bật phím nhanh"),
             BotCommand(command="hidequick",   description="Ẩn phím nhanh"),
             BotCommand(command="help",        description="Hướng dẫn và lệnh quản trị"),
+            BotCommand(command="api",         description="API key và hướng dẫn tích hợp"),
+            BotCommand(command="api_review",  description="Đơn API cần kiểm tra"),
             BotCommand(command="thongbao",    description="Gửi thông báo"),
             BotCommand(command="setnote",     description="Cập nhật ghi chú dịch vụ"),
             BotCommand(command="khachdangdu", description="Khách còn số dư"),
@@ -1746,6 +1833,160 @@ async def reset_bot_on_startup():
         logging.info("Đã reset commands và menu button thành công.")
     except Exception:
         logging.exception("Không reset được commands/menu button")
+
+
+def customer_api_base_url():
+    configured = os.getenv("CUSTOMER_API_BASE_URL", "").strip().rstrip("/")
+    if not configured:
+        domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().strip("/")
+        configured = f"https://{domain}" if domain else "https://TEN-MIEN-BOT-OTP"
+    return configured if configured.endswith("/api/v1") else configured + "/api/v1"
+
+
+async def api_private_chat(message):
+    if message.chat.type != "private":
+        await message.answer("Vui lòng mở chat riêng với bot rồi gửi /api để quản lý API key.")
+        return False
+    return True
+
+
+async def show_customer_api(message, user):
+    if not await api_private_chat(message):
+        return
+    save_user(user)
+    info = customer_api.key_info(user.id)
+    label = f"Đang hoạt động · …{info['suffix']}" if info else "Chưa tạo API key"
+    rows = [[InlineKeyboardButton(text="📘 Hướng dẫn API", callback_data="customer_api_guide", style="primary")]]
+    if info:
+        rows.append([InlineKeyboardButton(text="🔄 Đổi API key", callback_data="customer_api_rotate")])
+        rows.append([InlineKeyboardButton(text="⛔ Thu hồi API key", callback_data="customer_api_revoke")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔑 Tạo API key", callback_data="customer_api_create", style="success")])
+    rows.append([InlineKeyboardButton(text="💳 Nạp tiền", callback_data="deposit"), InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")])
+    await message.answer(
+        "🔌 <b>API CHO KHÁCH HÀNG</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"💰 Số dư dùng chung: <b>{get_balance(user.id):,}đ</b>\n"
+        f"🔑 Key: <b>{label}</b>\n"
+        f"🌐 Base URL: <code>{html.escape(customer_api_base_url())}</code>\n\n"
+        "Tích hợp thuê số và đọc OTP vào phần mềm của bạn. Giá bán giống trong bot, thanh toán bằng số dư hiện có.\n"
+        "Key chỉ hiển thị đầy đủ khi tạo hoặc đổi mới. Giữ key riêng cho ứng dụng của bạn.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.message(Command("api"))
+async def customer_api_command(m: Message, state: FSMContext):
+    await state.clear()
+    await show_customer_api(m, m.from_user)
+
+
+@dp.callback_query(F.data == "customer_api")
+async def customer_api_menu_callback(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    await show_customer_api(c.message, c.from_user)
+
+
+@dp.callback_query(F.data.in_({"customer_api_create", "customer_api_rotate", "customer_api_revoke",
+                              "customer_api_rotate_confirm", "customer_api_revoke_confirm"}))
+async def customer_api_key_callback(c: CallbackQuery):
+    await c.answer()
+    if not await api_private_chat(c.message):
+        return
+    if c.data in {"customer_api_rotate", "customer_api_revoke"}:
+        await c.message.answer(
+            "API key hiện tại sẽ ngừng hoạt động ngay. Các đơn đã tạo vẫn tiếp tục được xử lý.\nBạn xác nhận thay đổi?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✓ Xác nhận", callback_data=c.data + "_confirm", style="danger")],
+                [InlineKeyboardButton(text="← Quay lại", callback_data="customer_api")],
+            ]),
+        )
+        return
+    save_user(c.from_user)
+    if c.data == "customer_api_revoke_confirm":
+        customer_api.revoke_key(c.from_user.id)
+        await c.message.answer("✅ Đã thu hồi API key.")
+        return await show_customer_api(c.message, c.from_user)
+    try:
+        key = customer_api.issue_key(c.from_user.id, rotate=c.data == "customer_api_rotate_confirm")
+    except ValueError as exc:
+        return await c.message.answer(str(exc))
+    await c.message.answer(
+        "🔑 <b>API KEY CỦA BẠN</b>\n\n"
+        f"<code>{key}</code>\n\n"
+        "Hãy lưu key này. Bot chỉ lưu dấu xác thực và không đọc lại được key đầy đủ.\n"
+        "Dùng header: <code>Authorization: Bearer YOUR_API_KEY</code>",
+        protect_content=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📘 Hướng dẫn API", callback_data="customer_api_guide")],
+            [InlineKeyboardButton(text="← Quản lý API", callback_data="customer_api")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data == "customer_api_guide")
+async def customer_api_guide_callback(c: CallbackQuery):
+    await c.answer()
+    if not await api_private_chat(c.message):
+        return
+    guide = (BASE_DIR / "API_GUIDE.md").read_text(encoding="utf-8").replace("{{BASE_URL}}", customer_api_base_url())
+    await c.message.answer(
+        "📘 <b>HƯỚNG DẪN API</b>\n\n"
+        f"Base URL: <code>{html.escape(customer_api_base_url())}</code>\n"
+        "• <code>GET /balance</code> — số dư\n"
+        "• <code>GET /services</code> — dịch vụ và giá bán\n"
+        "• <code>POST /orders</code> — thuê số\n"
+        "• <code>GET /orders/ORDER_ID</code> — trạng thái, số và OTP\n"
+        "• <code>GET /orders</code> — lịch sử API\n\n"
+        "Gửi API key bằng header Authorization. Khi thuê, thêm Idempotency-Key riêng cho từng đơn; gọi lại cùng đơn thì giữ nguyên mã này.\n"
+        "File đính kèm có ví dụ Python, cURL, trạng thái đơn và mã lỗi.",
+    )
+    await c.message.answer_document(BufferedInputFile(guide.encode("utf-8"), filename="Huong_dan_API_OTP.md"))
+
+
+async def notify_api_review(order_id, user_id, price):
+    await bot.send_message(ADMIN_ID,
+        f"⚠️ <b>ĐƠN API CẦN KIỂM TRA</b>\nMã đơn: <code>{order_id}</code>\n"
+        f"Khách: <code>{user_id}</code> · Số tiền: <b>{price:,}đ</b>\n"
+        "Kết quả cấp số chưa rõ. Mở /api_review để kiểm tra; không tạo lại đơn tự động.")
+
+
+@dp.message(Command("api_review"))
+async def api_review_command(m: Message):
+    if m.from_user.id != ADMIN_ID or not await api_private_chat(m):
+        return
+    reviews = customer_api.pending_reviews()
+    if not reviews:
+        return await m.answer("Không có đơn API cần kiểm tra.")
+    lines = ["⚠️ <b>ĐƠN API CẦN KIỂM TRA</b>", "Xác minh đơn trước khi hoàn tiền. Các khoản này chưa được tự hoàn.", ""]
+    rows = []
+    for row in reviews:
+        lines.append(f"<code>{row['order_id']}</code> · Khách {row['user_id']} · {row['price']:,}đ")
+        rows.append([InlineKeyboardButton(text=f"Hoàn {row['order_id']}", callback_data=f"api_refund_check|{row['order_id']}")])
+    await m.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("api_refund_check|"))
+@dp.callback_query(F.data.startswith("api_refund_confirm|"))
+async def api_review_refund_callback(c: CallbackQuery):
+    if c.from_user.id != ADMIN_ID:
+        return await c.answer("Bạn không có quyền.", show_alert=True)
+    await c.answer()
+    if not await api_private_chat(c.message):
+        return
+    action, order_id = c.data.split("|", 1)
+    if action == "api_refund_check":
+        await c.message.answer(
+            f"Hoàn đơn <code>{html.escape(order_id)}</code> sau khi đã xác minh khách chưa nhận số/OTP.\n"
+            "Xác nhận sẽ cộng lại tiền vào ví của khách.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Đã kiểm tra, xác nhận hoàn", callback_data=f"api_refund_confirm|{order_id}", style="danger")],
+            ]),
+        )
+        return
+    changed = customer_api.refund_allocation(order_id, "ADMIN_REFUNDED", allowed_status="review")
+    await c.message.answer("✅ Đã hoàn tiền một lần vào ví khách." if changed else "Đơn không còn cần kiểm tra hoặc đã hoàn trước đó.")
 
 
 @dp.message(Command("start"))
@@ -1854,6 +2095,7 @@ async def help_command(m: Message, state: FSMContext):
         "<b>OTP đang chờ:</b> Xem mọi phiên đang chạy và tự làm mới trạng thái.\n\n"
         "<b>Thanh toán:</b> Chọn Nạp tiền → chọn mệnh giá → quét QR. Số dư được cộng tự động.\n\n"
         "<b>Đơn nạp:</b> Theo dõi trạng thái, sao chép nội dung hoặc tạo lại đơn hết hạn.\n\n"
+        "<b>Tích hợp API:</b> Gửi /api để lấy key và hướng dẫn. Thuê số qua API dùng chung số dư với bot.\n\n"
         "<b>Bảo hành:</b> Không có OTP trong thời gian chờ, hệ thống tự hoàn tiền. Mã sai không thuộc chính sách hoàn.\n\n"
         f"<b>Giới thiệu:</b> Nhận <b>{REFERRAL_FIRST_BONUS:,}đ + 10%</b> khi bạn bè nạp lần đầu từ <b>{REFERRAL_MIN_DEPOSIT:,}đ</b>."
     )
@@ -1863,7 +2105,8 @@ async def help_command(m: Message, state: FSMContext):
             "/users · /sodu · /khachdangdu\n"
             "/congtien · /trutien · /setsodu\n"
             "/thongbao · /refstats · /backup\n"
-            "/setnote · /delnote · /notes"
+            "/setnote · /delnote · /notes\n"
+            "/api_review — kiểm tra đơn API chưa rõ kết quả"
         )
     await m.answer(text, reply_markup=main_menu_keyboard(m.from_user.id))
 
@@ -1889,7 +2132,10 @@ async def reply_kb_handler(m: Message, state: FSMContext):
             "🔎 <b>TÌM DỊCH VỤ</b>\n"
             f"{UI_DIVIDER}\n"
             "Nhập tên dịch vụ bạn cần. Có thể tìm không dấu.\n"
-            "Ví dụ: <code>Facebook</code>, <code>gmail</code>, <code>shopee</code>."
+            "Ví dụ: <code>Facebook</code>, <code>gmail</code>, <code>shopee</code>.\n\n"
+            "Có thể gõ tắt: <code>fb</code>, <code>gg</code>, <code>ig</code>.\n\n"
+            "Không Tìm Được App Cần Làm Vui Lòng Gõ tìm kiếm: <b>DỊCH VỤ KHÁC</b>",
+            reply_markup=search_navigation_keyboard(),
         )
     elif text == "⏳ OTP đang chờ":
         await m.answer(
@@ -2579,6 +2825,170 @@ async def admin_set_user_balance(m: Message):
         logging.exception("Không gửi được thông báo set số dư cho khách")
 
 # --- XỬ LÝ NẠP TIỀN ---
+def rental_shortfall_keyboard(user_id, app_id, app_name, sell_price, current_balance,
+                              *, carrier=None, phone=None, history_id=None):
+    token = secrets.token_hex(8)
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO rental_intents(token, user_id, app_id, app_name, sell_price, carrier, phone, history_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (token, user_id, int(app_id), app_name, int(sell_price), carrier, phone, history_id))
+        conn.commit()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📲 Nạp thêm {max(0, sell_price - current_balance):,}đ",
+                              callback_data=f"rental_topup|{token}", style="success")],
+        [InlineKeyboardButton(text="💳 Nạp số tiền khác", callback_data="deposit")],
+        [InlineKeyboardButton(text="← Về danh mục", callback_data="otp_list")],
+    ])
+
+
+def get_rental_intent(token, user_id):
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT * FROM rental_intents
+            WHERE token = ? AND user_id = ? AND consumed = 0
+              AND created_at >= datetime('now', '-1 day')
+        """, (token, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+async def current_rental_intent(token, user_id):
+    intent = get_rental_intent(token, user_id)
+    if not intent:
+        raise ValueError("Lựa chọn thuê đã hết hạn hoặc đã được sử dụng. Vui lòng chọn lại dịch vụ.")
+    if intent["history_id"]:
+        row = get_otp_history_by_id(intent["history_id"], user_id)
+        if not row:
+            raise ValueError("Không còn lịch sử của số cần thuê lại. Vui lòng chọn lại dịch vụ.")
+        price = int(row["sell_price"])
+    else:
+        res = await get_fixed_apps_from_api()
+        if res.get("ResponseCode") != 0:
+            raise ValueError("Chưa tải được giá dịch vụ. Vui lòng thử lại sau.")
+        item = next((item for item in res.get("Result", []) if int(item["Id"]) == intent["app_id"]), None)
+        if not item:
+            raise ValueError("Dịch vụ hiện không còn mở bán. Vui lòng chọn dịch vụ khác.")
+        price = int(float(item.get("Cost", 0)) * RUNTIME_CONFIG["price_mul"])
+    if price <= 0:
+        raise ValueError("Dịch vụ chưa có giá hợp lệ. Vui lòng thử lại sau.")
+    intent["sell_price"] = price
+    return intent
+
+
+def rental_deposit_keyboard(token=None):
+    rows = []
+    if token:
+        rows.append([InlineKeyboardButton(text="✅ Tiếp tục dịch vụ đã chọn", callback_data=f"rental_resume|{token}", style="success")])
+    rows.extend(deposit_navigation_keyboard().inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def deposit_paid_keyboard(order_id, user_id):
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT token FROM rental_intents WHERE deposit_id = ? AND user_id = ? AND consumed = 0
+            ORDER BY created_at DESC LIMIT 1
+        """, (order_id, user_id)).fetchone()
+    rows = []
+    if row:
+        rows.append([InlineKeyboardButton(text="✅ Tiếp tục dịch vụ đã chọn", callback_data=f"rental_resume|{row['token']}", style="success")])
+    rows.extend([
+        [InlineKeyboardButton(text="⚡ Thuê số ngay", callback_data="otp_list", style="primary")],
+        [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_rental_confirmation(c, intent):
+    balance = get_balance(c.from_user.id)
+    price = intent["sell_price"]
+    if c.from_user.id != ADMIN_ID and balance < price:
+        await c.message.answer(
+            f"💳 Số dư: <b>{balance:,}đ</b> · Giá thuê: <b>{price:,}đ</b>\n"
+            f"Cần nạp thêm: <b>{price - balance:,}đ</b>.",
+            reply_markup=rental_shortfall_keyboard(
+                c.from_user.id, intent["app_id"], intent["app_name"], price, balance,
+                carrier=intent["carrier"], phone=intent["phone"], history_id=intent["history_id"],
+            ),
+        )
+        return
+    detail = f"Số cần thuê: <code>{html.escape(intent['phone'])}</code>\n" if intent["phone"] else ""
+    await c.message.answer(
+        "✅ <b>XÁC NHẬN TIẾP TỤC THUÊ</b>\n"
+        f"{UI_DIVIDER}\n"
+        f"Dịch vụ: <b>{html.escape(intent['app_name'])}</b>\n"
+        f"Nhà mạng: <b>{html.escape(intent['carrier'] or 'Ngẫu nhiên')}</b>\n"
+        f"{detail}Giá thuê: <b>{price:,}đ</b>\n"
+        f"Số dư: <b>{balance:,}đ</b>\n\n"
+        "Bấm xác nhận để tiếp tục. Nạp tiền chưa tự động thuê số.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✓ Xác nhận thuê · {price:,}đ", callback_data=f"rental_confirm|{intent['token']}|{price}", style="success")],
+            [InlineKeyboardButton(text="✕ Huỷ", callback_data="menu")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("rental_topup|"))
+async def rental_topup_callback(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    token = c.data.split("|", 1)[1]
+    async with RENTAL_LOCKS[c.from_user.id]:
+        try:
+            intent = await current_rental_intent(token, c.from_user.id)
+        except ValueError as exc:
+            return await c.message.answer(str(exc))
+        amount = max(0, intent["sell_price"] - get_balance(c.from_user.id))
+        await state.clear()
+        if amount == 0 or c.from_user.id == ADMIN_ID:
+            return await show_rental_confirmation(c, intent)
+        await send_deposit_checkout(c.message, c.from_user, amount, rental_token=token)
+
+
+@dp.callback_query(F.data.startswith("rental_resume|"))
+async def rental_resume_callback(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.clear()
+    try:
+        intent = await current_rental_intent(c.data.split("|", 1)[1], c.from_user.id)
+    except ValueError as exc:
+        return await c.message.answer(str(exc))
+    await show_rental_confirmation(c, intent)
+
+
+@dp.callback_query(F.data.startswith("rental_confirm|"))
+async def rental_confirm_callback(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split("|")
+    if len(parts) != 3 or not parts[2].isdigit():
+        return await c.answer("Lựa chọn không hợp lệ.", show_alert=True)
+    async with RENTAL_LOCKS[c.from_user.id]:
+        try:
+            intent = await current_rental_intent(parts[1], c.from_user.id)
+        except ValueError as exc:
+            return await c.answer(str(exc), show_alert=True)
+        price = intent["sell_price"]
+        if price != int(parts[2]) or (c.from_user.id != ADMIN_ID and get_balance(c.from_user.id) < price):
+            await c.answer("Giá hoặc số dư đã thay đổi. Vui lòng kiểm tra lại.")
+            return await show_rental_confirmation(c, intent)
+        with closing(db()) as conn:
+            updated = conn.execute("UPDATE rental_intents SET consumed = 1 WHERE token = ? AND user_id = ? AND consumed = 0",
+                                   (intent["token"], c.from_user.id)).rowcount
+            conn.commit()
+        if not updated:
+            return await c.answer("Lựa chọn này đã được xử lý.", show_alert=True)
+        await state.clear()
+        if intent["history_id"]:
+            return await rebuy_callback(c.model_copy(update={"data": f"rebuy_confirm|{intent['history_id']}"}))
+        if intent["phone"]:
+            await c.answer("Đang kiểm tra số đã chọn…")
+            await state.set_state(BuySpecificState.waiting_for_phone)
+            await state.update_data(app_id=intent["app_id"], app_name=intent["app_name"], sell_price=price)
+            return await buy_specific_phone_handler(c.message.model_copy(update={"from_user": c.from_user, "text": intent["phone"]}), state)
+        data = f"buy_confirm|{intent['app_id']}|{price}|{intent['app_name']}"
+        if intent["carrier"]:
+            data += f"|{intent['carrier']}"
+        await otp_buy_confirmed_callback(c.model_copy(update={"data": data}))
+
+
 @dp.callback_query(F.data == "deposit")
 async def deposit_start(c: CallbackQuery, state: FSMContext):
     await state.set_state(DepositState.waiting_for_amount)
@@ -2586,11 +2996,26 @@ async def deposit_start(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-async def send_deposit_checkout(message: Message, user, amount: int, loading_msg: Message | None = None):
+async def send_deposit_checkout(message: Message, user, amount: int, loading_msg: Message | None = None,
+                                *, rental_token: str | None = None):
     expire_old_pending_orders()
 
-    memo = f"NAP{user.id}_{int(datetime.now().timestamp() * 1000)}"
-    order_id = create_deposit_order(user.id, amount, memo)
+    existing = None
+    if rental_token:
+        intent = get_rental_intent(rental_token, user.id)
+        if not intent:
+            raise ValueError("Lựa chọn thuê đã hết hạn.")
+        existing = get_deposit_order_by_id(intent["deposit_id"]) if intent["deposit_id"] else None
+    if (existing and existing["user_id"] == user.id and existing["status"] == "pending"
+            and existing["amount"] == amount and not is_order_expired(existing)):
+        order_id, memo, amount = existing["id"], existing["memo"], existing["amount"]
+    else:
+        memo = f"NAP{user.id}_{int(datetime.now().timestamp() * 1000)}"
+        order_id = create_deposit_order(user.id, amount, memo)
+        if rental_token:
+            with closing(db()) as conn:
+                conn.execute("UPDATE rental_intents SET deposit_id = ? WHERE token = ? AND user_id = ?", (order_id, rental_token, user.id))
+                conn.commit()
 
     qr_url = (
         "https://img.vietqr.io/image/"
@@ -2612,6 +3037,8 @@ async def send_deposit_checkout(message: Message, user, amount: int, loading_msg
         "3️⃣ Chờ bot tự cộng số dư\n\n"
         f"⏱ QR hết hạn sau <b>{QR_EXPIRE_MINUTES} phút</b>."
     )
+    if rental_token:
+        customer_caption += "\n\nSau khi tiền được cộng, bấm Tiếp tục dịch vụ đã chọn để xác nhận thuê."
 
     admin_keyboard = InlineKeyboardMarkup(inline_keyboard=[[ 
         InlineKeyboardButton(text="✓ Duyệt thủ công", callback_data=f"admin_approve|{order_id}", style="success"),
@@ -2640,7 +3067,7 @@ async def send_deposit_checkout(message: Message, user, amount: int, loading_msg
         await message.answer_photo(
             photo=final_img,
             caption=customer_caption,
-            reply_markup=deposit_navigation_keyboard()
+            reply_markup=rental_deposit_keyboard(rental_token)
         )
         await loading_msg.delete()
     except Exception:
@@ -2655,7 +3082,7 @@ async def send_deposit_checkout(message: Message, user, amount: int, loading_msg
             f"Nội dung: <code>{memo}</code>\n"
             f"Mã đơn: <code>{order_id}</code>\n\n"
             f"⏱ Đơn hết hạn sau <b>{QR_EXPIRE_MINUTES} phút</b>.",
-            reply_markup=deposit_navigation_keyboard()
+            reply_markup=rental_deposit_keyboard(rental_token)
         )
 
     try:
@@ -2959,10 +3386,7 @@ async def admin_action_handler(c: CallbackQuery):
                 f"Đã cộng: <b>+{amount:,}đ</b>\n"
                 f"Mã đơn: <code>{order_id}</code>\n"
                 f"Số dư mới: <b>{new_balance:,}đ</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⚡ Thuê số ngay", callback_data="otp_list", style="success")],
-                    [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
-                ])
+                reply_markup=deposit_paid_keyboard(order_id, user_id),
             )
         except Exception:
             logging.exception("Không gửi được tin nhắn cộng tiền cho khách")
@@ -3042,11 +3466,10 @@ async def search_service_start(c: CallbackQuery, state: FSMContext):
         "🔎 <b>TÌM DỊCH VỤ</b>\n"
         f"{UI_DIVIDER}\n"
         "Nhập tên dịch vụ bạn cần, ví dụ: <code>Facebook</code>, <code>Gmail</code> hoặc <code>Shopee</code>.\n\n"
+        "Có thể gõ tắt: <code>fb</code>, <code>gg</code>, <code>ig</code>.\n\n"
+        "Không Tìm Được App Cần Làm Vui Lòng Gõ tìm kiếm: <b>DỊCH VỤ KHÁC</b>\n\n"
         "Có thể tìm không dấu · Gửi <code>/cancel</code> để huỷ.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="← Về danh mục", callback_data="otp_list")],
-            [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
-        ])
+        reply_markup=search_navigation_keyboard(),
     )
     await c.answer()
 
@@ -3061,7 +3484,18 @@ async def search_service_query(m: Message, state: FSMContext):
             main_menu_keyboard(m.from_user.id)
         )
 
-    query = normalize_search_text(m.text or "")
+    await render_service_search(m, state, m.text or "")
+
+
+@dp.callback_query(F.data == "search_other")
+async def search_other_callback(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    await state.set_state(SearchServiceState.waiting_for_query)
+    await render_service_search(c.message, state, "DỊCH VỤ KHÁC")
+
+
+async def render_service_search(m: Message, state: FSMContext, search_text: str):
+    query = normalize_search_text(search_text)
     if len(query) < 2:
         return await m.answer("Hãy nhập ít nhất <b>2 ký tự</b> để tìm kiếm.")
 
@@ -3069,23 +3503,13 @@ async def search_service_query(m: Message, state: FSMContext):
     if res.get("ResponseCode") != 0:
         return await m.answer("⚠️ Chưa kết nối được kho dịch vụ. Vui lòng thử lại sau.")
 
-    matches = [
-        app_item for app_item in res.get("Result", [])
-        if query in normalize_search_text(app_item.get("Name", ""))
-    ]
-    matches.sort(key=lambda item: (
-        not normalize_search_text(item.get("Name", "")).startswith(query),
-        normalize_search_text(item.get("Name", ""))
-    ))
+    matches = search_services(res.get("Result", []), query)
 
     if not matches:
         return await m.answer(
-            f"Không tìm thấy dịch vụ cho <code>{html.escape(m.text or '')}</code>.\n"
-            "Hãy thử tên ngắn hơn, ví dụ <code>face</code> hoặc <code>shop</code>.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📱 Xem tất cả dịch vụ", callback_data="otp_cat|all", style="primary")],
-                [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
-            ])
+            f"Không tìm thấy dịch vụ cho <code>{html.escape(search_text)}</code>.\n"
+            "Hãy thử tên ngắn hơn hoặc bấm <b>DỊCH VỤ KHÁC</b> bên dưới.",
+            reply_markup=search_navigation_keyboard(),
         )
 
     await state.clear()
@@ -3104,12 +3528,13 @@ async def search_service_query(m: Message, state: FSMContext):
             style="success"
         )])
 
+    btns.append([InlineKeyboardButton(text="🔎 DỊCH VỤ KHÁC", callback_data="search_other", style="primary")])
     btns.append([InlineKeyboardButton(text="🔎 Tìm từ khoá khác", callback_data="search_service", style="primary")])
     btns.append([InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")])
     await m.answer(
         "🔎 <b>KẾT QUẢ TÌM KIẾM</b>\n"
         f"{UI_DIVIDER}\n"
-        f"Tìm thấy <b>{len(matches)}</b> dịch vụ cho <code>{html.escape(m.text or '')}</code>:",
+        f"Tìm thấy <b>{len(matches)}</b> dịch vụ cho <code>{html.escape(search_text)}</code>:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=btns)
     )
 
@@ -3289,10 +3714,7 @@ async def otp_buy_preview_callback(c: CallbackQuery):
             f"Giá thuê: <b>{sell_price:,}đ</b>\n"
             f"Số dư: <b>{current_balance:,}đ</b>\n"
             f"Cần nạp thêm: <b>{sell_price - current_balance:,}đ</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💳 Nạp tiền ngay", callback_data="deposit", style="success")],
-                [InlineKeyboardButton(text="← Quay lại dịch vụ", callback_data=f"appinfo|{app_id}|{sell_price}|{app_name}")],
-            ])
+            reply_markup=rental_shortfall_keyboard(user_id, app_id, app_name, sell_price, current_balance, carrier=carrier),
         )
         return await c.answer("Bạn cần nạp thêm tiền để tiếp tục.")
 
@@ -3328,6 +3750,7 @@ async def otp_buy_preview_callback(c: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("buy_confirm|"))
+@serialize_wallet_purchase
 async def otp_buy_confirmed_callback(c: CallbackQuery):
     save_user(c.from_user)
     parts = c.data.split("|")
@@ -3346,10 +3769,7 @@ async def otp_buy_confirmed_callback(c: CallbackQuery):
                 f"Giá thuê: <b>{sell_price:,}đ</b>\n"
                 f"Số dư: <b>{current_balance:,}đ</b>\n"
                 f"Cần nạp thêm: <b>{sell_price - current_balance:,}đ</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💳 Nạp tiền ngay", callback_data="deposit", style="success")],
-                    [InlineKeyboardButton(text="← Quay lại dịch vụ", callback_data=f"appinfo|{app_id}|{sell_price}|{app_name}")],
-                ])
+                reply_markup=rental_shortfall_keyboard(user_id, app_id, app_name, sell_price, current_balance, carrier=carrier),
             )
             return await c.answer("Bạn cần nạp thêm tiền để tiếp tục.")
 
@@ -3380,6 +3800,7 @@ async def otp_buy_confirmed_callback(c: CallbackQuery):
         req_id = res["Result"]["Id"]
         display_phone = normalize_phone_vn(phone)
         save_otp_history(user_id, int(app_id), app_name, display_phone, sell_price, raw_phone=phone, req_id=req_id)
+        start_otp_watcher(user_id, req_id)
         await c.message.edit_text(
             "<b>BƯỚC 4/4 · ĐANG CHỜ OTP</b>\n"
             f"{UI_DIVIDER}\n"
@@ -3390,7 +3811,6 @@ async def otp_buy_confirmed_callback(c: CallbackQuery):
             "<i>Nếu hết thời gian mà chưa có OTP, tiền sẽ tự hoàn.</i>",
             reply_markup=waiting_otp_keyboard(display_phone)
         )
-        asyncio.create_task(wait_for_otp(user_id, req_id, display_phone, sell_price, (user_id == ADMIN_ID), app_name))
     else:
         await c.message.edit_text(
             "⚠️ <b>CHƯA TÌM ĐƯỢC SỐ</b>\n"
@@ -3436,6 +3856,7 @@ async def buy_specific_callback(c: CallbackQuery, state: FSMContext):
 
 
 @dp.message(BuySpecificState.waiting_for_phone)
+@serialize_wallet_purchase
 async def buy_specific_phone_handler(m: Message, state: FSMContext):
     if m.text and m.text.strip().lower() == "/cancel":
         await state.clear()
@@ -3472,10 +3893,7 @@ async def buy_specific_phone_handler(m: Message, state: FSMContext):
                 f"Giá thuê: <b>{sell_price:,}đ</b>\n"
                 f"Số dư: <b>{current_balance:,}đ</b>\n"
                 f"Cần nạp thêm: <b>{sell_price - current_balance:,}đ</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💳 Nạp tiền ngay", callback_data="deposit", style="success")],
-                    [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
-                ])
+                reply_markup=rental_shortfall_keyboard(user_id, app_id, app_name, sell_price, current_balance, phone=phone_number),
             )
 
     api_phone = to_api_phone(phone_number)
@@ -3522,6 +3940,7 @@ async def buy_specific_phone_handler(m: Message, state: FSMContext):
         save_otp_history(user_id, int(app_id), app_name, actual_phone, sell_price,
                          raw_phone=raw_phone, req_id=req_id)
 
+        start_otp_watcher(user_id, req_id)
         await msg.edit_text(
             "<b>BƯỚC 4/4 · ĐANG CHỜ OTP</b>\n"
             f"{UI_DIVIDER}\n"
@@ -3530,9 +3949,6 @@ async def buy_specific_phone_handler(m: Message, state: FSMContext):
             f"Đã thanh toán: <b>{sell_price:,}đ</b>\n\n"
             "OTP sẽ được gửi ngay khi có. Nếu hết thời gian chờ, tiền sẽ tự hoàn.",
             reply_markup=waiting_otp_keyboard(actual_phone)
-        )
-        asyncio.create_task(
-            wait_for_otp(user_id, req_id, actual_phone, sell_price, is_admin, app_name)
         )
     else:
         await msg.edit_text(
@@ -3549,14 +3965,86 @@ async def buy_specific_phone_handler(m: Message, state: FSMContext):
         )
 
 
+def start_otp_watcher(user_id, req_id):
+    """Mỗi phiên chỉ có một tác vụ; luôn dùng dữ liệu thanh toán đã lưu."""
+    key = (int(user_id), str(req_id))
+    existing = OTP_WATCH_TASKS.get(key)
+    if existing and not existing.done():
+        return existing
+    row = get_otp_history_by_req(user_id, req_id)
+    if not row or row["status"] != "waiting":
+        return None
+    task = asyncio.create_task(wait_for_otp(
+        user_id, req_id, row["phone"], int(row["sell_price"]), user_id == ADMIN_ID and row["source"] != "api", row["app_name"],
+    ))
+    OTP_WATCH_TASKS[key] = task
+
+    def finished(completed):
+        if OTP_WATCH_TASKS.get(key) is completed:
+            OTP_WATCH_TASKS.pop(key, None)
+        if not completed.cancelled() and completed.exception():
+            logging.error("OTP watcher failed for history %s: %s", row["id"], type(completed.exception()).__name__)
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def restore_waiting_otp():
+    restored = 0
+    for row in get_all_waiting_otp():
+        key = (int(row["user_id"]), str(row["req_id"]))
+        existing = OTP_WATCH_TASKS.get(key)
+        if not existing or existing.done():
+            if start_otp_watcher(int(row["user_id"]), row["req_id"]):
+                restored += 1
+        await asyncio.sleep(0)
+    if restored:
+        logging.info("Resumed %s waiting OTP sessions", restored)
+    return restored
+
+
+async def otp_recovery_loop():
+    while True:
+        try:
+            await restore_waiting_otp()
+        except Exception:
+            logging.exception("Could not restore waiting OTP sessions")
+        await asyncio.sleep(30)
+
+
+async def stop_otp_watchers():
+    tasks = list(OTP_WATCH_TASKS.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    OTP_WATCH_TASKS.clear()
+
+
 async def wait_for_otp(user_id, req_id, phone, sell_price, is_admin, app_name):
-    for _ in range(60):
-        await asyncio.sleep(7)
-        res = await otp_api.get_otp_code(req_id)
+    row = get_otp_history_by_req(user_id, req_id)
+    if not row or row["status"] != "waiting":
+        return
+    try:
+        created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        deadline = created_at.timestamp() + OTP_WAIT_SECONDS
+    except (ValueError, TypeError):
+        # Không đoán thời hạn bản ghi lỗi; chỉ kết thúc khi nguồn xác nhận hết hạn.
+        deadline = float("inf")
+    while True:
+        row = get_otp_history_by_req(user_id, req_id)
+        if not row or row["status"] != "waiting":
+            return
+        async with OTP_POLL_LIMIT:
+            res = await otp_api.get_otp_code(req_id)
+        if res.get("_transport_error"):
+            await asyncio.sleep(30)
+            continue
         if res.get("ResponseCode") == 0:
             updated = update_otp_history_status(user_id, req_id, "success", res["Result"]["Code"])
             if not updated:
                 # Phiên đã được làm mới hoặc hoàn ở thao tác khác, không gửi thông báo trùng.
+                return
+            if row["source"] == "api":
                 return
             await bot.send_message(
                 user_id,
@@ -3571,11 +4059,16 @@ async def wait_for_otp(user_id, req_id, phone, sell_price, is_admin, app_name):
             return
         elif res.get("ResponseCode") == 2:
             break
+        elif res.get("ResponseCode") == 1 and _time.time() >= deadline:
+            break
+        await asyncio.sleep(OTP_POLL_SECONDS)
 
     if not is_admin:
         async with BALANCE_LOCK:
             refund_result = refund_waiting_otp_once(user_id, req_id=req_id)
 
+        if row["source"] == "api":
+            return
         if refund_result is not None:
             await bot.send_message(
                 user_id,
@@ -3595,7 +4088,8 @@ async def wait_for_otp(user_id, req_id, phone, sell_price, is_admin, app_name):
                     reply_markup=standard_navigation_keyboard()
                 )
     elif sell_price == 0:
-        update_otp_history_status(user_id, req_id, "expired")
+        if not update_otp_history_status(user_id, req_id, "expired"):
+            return
         await bot.send_message(
             user_id,
             "⌛ <b>SESSION ĐÃ HẾT HẠN</b>\n"
@@ -3604,7 +4098,8 @@ async def wait_for_otp(user_id, req_id, phone, sell_price, is_admin, app_name):
             reply_markup=standard_navigation_keyboard(include_history=True)
         )
     else:
-        update_otp_history_status(user_id, req_id, "expired")
+        if not update_otp_history_status(user_id, req_id, "expired"):
+            return
         await bot.send_message(
             user_id,
             f"⌛ Số <code>{phone}</code> đã hết thời gian chờ (tài khoản admin).",
@@ -3758,7 +4253,7 @@ async def active_otp_detail_callback(c: CallbackQuery):
         return await c.answer("Đã nhận OTP")
 
     if response_code == 2:
-        if c.from_user.id == ADMIN_ID:
+        if c.from_user.id == ADMIN_ID and row["source"] != "api":
             update_otp_history_status(c.from_user.id, row["req_id"], "expired")
             refund_result = None
         else:
@@ -4044,6 +4539,7 @@ async def rebuy_preview_callback(c: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("rebuy_confirm|"))
+@serialize_wallet_purchase
 async def rebuy_callback(c: CallbackQuery):
     save_user(c.from_user)
     parts = c.data.split("|")
@@ -4082,8 +4578,14 @@ async def rebuy_callback(c: CallbackQuery):
         code_res = await otp_api.get_otp_code(stored_req_id)
         rc = code_res.get("ResponseCode")
 
-        if rc == 1:
+        if code_res.get("_transport_error"):
+            await c.message.edit_text("⚠️ Chưa kiểm tra được phiên cũ. Vui lòng thử lại sau.",
+                                      reply_markup=standard_navigation_keyboard(include_history=True))
+            return await c.answer()
+
+        if rc == 1 and row["status"] == "waiting":
             # Session còn sống, đang chờ OTP → poll tiếp, không trừ tiền
+            start_otp_watcher(user_id, stored_req_id)
             await c.message.edit_text(
                 "⏳ <b>TIẾP TỤC CHỜ OTP · KHÔNG MẤT PHÍ</b>\n"
                 f"{UI_DIVIDER}\n"
@@ -4091,13 +4593,6 @@ async def rebuy_callback(c: CallbackQuery):
                 f"Dịch vụ: <b>{html.escape(app_name)}</b>\n\n"
                 "Phiên cũ vẫn còn hiệu lực. OTP sẽ được gửi ngay khi có.",
                 reply_markup=waiting_otp_keyboard(phone_number)
-            )
-            asyncio.create_task(
-                wait_for_otp(
-                    user_id=user_id, req_id=stored_req_id,
-                    phone=phone_number, sell_price=0,
-                    is_admin=True, app_name=app_name
-                )
             )
             return await c.answer()
 
@@ -4114,10 +4609,8 @@ async def rebuy_callback(c: CallbackQuery):
                 f"Giá thuê lại: <b>{sell_price:,}đ</b>\n"
                 f"Số dư: <b>{current_balance:,}đ</b>\n"
                 f"Cần nạp thêm: <b>{sell_price - current_balance:,}đ</b>",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💳 Nạp tiền ngay", callback_data="deposit", style="success")],
-                    [InlineKeyboardButton(text="← Về lịch sử", callback_data="otp_history|0")],
-                ])
+                reply_markup=rental_shortfall_keyboard(user_id, app_id, app_name, sell_price, current_balance,
+                                                      phone=phone_number, history_id=hid),
             )
             return await c.answer("Bạn cần nạp thêm tiền để thuê lại số.")
 
@@ -4159,6 +4652,7 @@ async def rebuy_callback(c: CallbackQuery):
         save_otp_history(user_id, app_id, app_name, actual_phone, sell_price,
                          raw_phone=raw_phone, req_id=new_req_id)
 
+        start_otp_watcher(user_id, new_req_id)
         await c.message.edit_text(
             "<b>BƯỚC 4/4 · ĐANG CHỜ OTP</b>\n"
             f"{UI_DIVIDER}\n"
@@ -4169,13 +4663,6 @@ async def rebuy_callback(c: CallbackQuery):
             reply_markup=waiting_otp_keyboard(actual_phone)
         )
 
-        asyncio.create_task(
-            wait_for_otp(
-                user_id=user_id, req_id=new_req_id,
-                phone=actual_phone, sell_price=sell_price,
-                is_admin=is_admin, app_name=app_name
-            )
-        )
         await c.answer()
     else:
         msg = res.get("Msg", "Lỗi không xác định")
@@ -4448,10 +4935,7 @@ async def sepay_webhook_post(request: Request):
             f"Mã đơn: <code>{matched['id']}</code>\n"
             f"Số dư mới: <b>{new_balance:,}đ</b>\n\n"
             "Giao dịch đã được ngân hàng xác nhận tự động.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⚡ Thuê số ngay", callback_data="otp_list", style="success")],
-                [InlineKeyboardButton(text="⌂ Trang chủ", callback_data="menu")],
-            ])
+            reply_markup=deposit_paid_keyboard(matched["id"], matched["user_id"]),
         )
     except Exception:
         logging.exception("Không gửi được thông báo nạp tiền cho khách")
@@ -4498,6 +4982,21 @@ async def sepay_webhook_post(request: Request):
     return {"ok": True, "message": "processed"}
 
 # --- RUN ---
+customer_api = CustomerApi(
+    db=db,
+    catalog=lambda: get_fixed_apps_from_api(),
+    price_multiplier=lambda: RUNTIME_CONFIG["price_mul"],
+    request_number=lambda *args, **kwargs: otp_api.request_number(*args, **kwargs),
+    start_watcher=lambda user_id, req_id: start_otp_watcher(user_id, req_id),
+    normalize_phone=normalize_phone_vn,
+    valid_phone=is_valid_phone_vn,
+    to_api_phone=to_api_phone,
+    purchase_locks=PURCHASE_LOCKS,
+    notify_review=lambda *args: notify_api_review(*args),
+)
+customer_api.install(app)
+
+
 async def run_bot():
     await dp.start_polling(bot)
 
@@ -4508,9 +5007,11 @@ async def run_web():
 
 async def main():
     init_db()
+    customer_api.recover_allocations()
     await refresh_runtime_config()   # đọc OTP key/URL từ Firebase trước khi chạy
     await reset_bot_on_startup()
     print("Bot + SePay webhook is running...")
+    recovery_task = asyncio.create_task(otp_recovery_loop())
     try:
         await asyncio.gather(
             run_bot(),
@@ -4518,6 +5019,10 @@ async def main():
             config_refresh_loop()
         )
     finally:
+        recovery_task.cancel()
+        await asyncio.gather(recovery_task, return_exceptions=True)
+        await customer_api.close()
+        await stop_otp_watchers()
         await HTTP_CLIENT.aclose()
 
 if __name__ == "__main__":
